@@ -1,11 +1,10 @@
 #!/bin/env python
 
 
-import os,sys,select,pprint,urllib2,json,boto3
+import os,sys,select,pprint,urllib2,json
 from slackclient import SlackClient
 from logbook import FileHandler, Logger
 from subprocess import call,Popen,PIPE,STDOUT
-from datetime import datetime as dt
 
 
 user_slack_token = "mytoken"
@@ -13,7 +12,7 @@ slack_channel = "#platforms-ngen-status"
 
 
 logger = Logger('[Slack Call]')
-log_handler = FileHandler('/tmp/kube-nodes-status.log')
+log_handler = FileHandler('/tmp/slack-call3.log')
 log_handler.push_application()
 
 
@@ -53,63 +52,69 @@ def call_kube_api(base_url="http://localhost:8001",get_params=""):
         
     except urllib2.HTTPError as e:
         logger.error("%s: %s" % (call_params,e))
+        
 
-
-def get_cpu_utilization(ec2InstanceId):
-    client = boto3.client('cloudwatch')
-    response = client.get_metric_statistics(
-        Namespace="AWS/EC2",
-        MetricName="CPUUtilization",
-        StartTime=dt(2016,12,1),
-        EndTime=dt.utcnow(),
-        Period=3600,
-        Statistics=["Average","SampleCount","Minimum","Maximum"],
-        Dimensions=[{"Name":"InstanceId","Value":ec2InstanceId}]
-    
-    )
-    return response["Datapoints"]
-
-
-
-
-#Nodes
-
-call_params = "/api/v1/nodes"
+#Namespaces
+call_params = "/api/v1/namespaces"
 kube_api_url = "http://localhost:8001"
 resj = json.loads(call_kube_api(kube_api_url,call_params))
-node_problems = []
-cpuStatProblem = []
-for status in resj["items"]:
+msgs = "PODS STATUS:\n"
+pod_msgs = []
 
-    instanceId = status["spec"]["externalID"]
-    cpuUtilStatus = get_cpu_utilization(instanceId)
-    for metric in cpuUtilStatus:
-        if metric["Average"] > 61:
-            metric["Timestamp"] = str(metric["Timestamp"])
-            cpuStatProblem.append({"instanceId":instanceId,"metric":"CPUUtilization","details":metric})
 
-    if len(cpuStatProblem) > 0:
-        post_on_slack(slack_channel, json.dumps(cpuStatProblem,indent=4))
+for item in resj["items"]:
 
-    problems = []
+    res = json.loads(call_kube_api("%s/%s/pods" % (kube_api_url,item["metadata"]["selfLink"])))
+    container_msg = []
     
-    for cond in status["status"]["conditions"]:
-        if cond["type"] == "OutOfDisk" and cond["status"]=="True":
-                problems.append(json.dumps(cond,indent=4))
-        if cond["type"] == "MemoryPressure" and cond["status"]=="True":
-            problems.append(json.dumps(cond,indent=4))
-        if cond["type"] == "DiskPressure" and cond["status"]=="True":
-            problems.append(json.dumps(cond,indent=4))
-        if cond["type"] == "Ready" and cond["status"]=="False":
-            problems.append(json.dumps(cond,indent=4))
-
-    if len(problems) > 0:
-        node_problems.append({"instanceId":instanceId,"problems":problems,"details":status})
+    for pod_item in res["items"]:
         
-if len(node_problems) > 0:
-        details = json.dumps(node_problems,indent=4)
-        post_on_slack(slack_channel, details)
-        print details
+        if "kubernetes.io/created-by" in pod_item["metadata"]["annotations"]:
+            
+            service_name = json.loads(pod_item["metadata"]["annotations"]["kubernetes.io/created-by"])["reference"]["name"]
+            cont_msgs = []
+            
+            for cs in pod_item["status"]["containerStatuses"]:
+
+                cs_details = None
+
+                if cs["restartCount"]==0 and cs["ready"]==True:
+                    pass
+                elif cs["restartCount"]>0 and cs["ready"]==True:
+                    cs_details = json.dumps(cs,indent=4)
+                else:
+                    cs_details = json.dumps(cs,indent=4)
+
+                if cs_details is not None:
+                    cont_msgs.append({cs_details})
+                
+        container_msg.append({service_name:cont_msgs})
+
+    pod_msgs.append(container_msg)
+
+for pod_msg in pod_msgs:
+    for msg_ar in pod_msg:
+        for pod_name,v in msg_ar.items():
+            pod_set = False
+            pod = "POD NAME:\t%s\n" % pod_name
+            for msg in v:
+                if len(msg) > 0:
+                    if pod_set == False:
+                        lmsg = "%s\t%s\n" % (pod,msg.pop())
+                        msgs = msgs + lmsg
+                        pod_set = True
+                    else:
+                        lmsg = "\t%s\n" % msg.pop()
+                        msgs = msgs + lmsg
+verbose = True
+
+if verbose == True:
+    print msgs
+
+set_post_on_slack = True
+
+if set_post_on_slack == True:
+    post_on_slack(slack_channel,msgs)
 
 
 
